@@ -3,6 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/http"
+	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -24,6 +28,10 @@ var cmdAccount = &cli.Command{
 			Name:  "login",
 			Usage: "create session with PDS instance",
 			Flags: []cli.Flag{
+				&cli.BoolFlag{
+					Name:  "oauth",
+					Usage: "log in with atproto OAuth in the browser instead of an app password",
+				},
 				&cli.StringFlag{
 					Name:     "username",
 					Aliases:  []string{"u"},
@@ -32,11 +40,10 @@ var cmdAccount = &cli.Command{
 					Sources:  cli.EnvVars("GOAT_USERNAME", "ATP_USERNAME", "ATP_AUTH_USERNAME"),
 				},
 				&cli.StringFlag{
-					Name:     "password",
-					Aliases:  []string{"p", "app-password"},
-					Required: true,
-					Usage:    "password (app password recommended)",
-					Sources:  cli.EnvVars("GOAT_PASSWORD", "ATP_PASSWORD", "ATP_AUTH_PASSWORD"),
+					Name:    "password",
+					Aliases: []string{"p", "app-password"},
+					Usage:   "password (app password recommended)",
+					Sources: cli.EnvVars("GOAT_PASSWORD", "ATP_PASSWORD", "ATP_AUTH_PASSWORD"),
 				},
 				&cli.StringFlag{
 					Name:    "auth-factor-token",
@@ -198,6 +205,12 @@ var cmdAccount = &cli.Command{
 }
 
 func runAccountLogin(ctx context.Context, cmd *cli.Command) error {
+	if cmd.Bool("oauth") {
+		return runAccountOAuthLogin(ctx, cmd)
+	}
+	if cmd.String("password") == "" {
+		return fmt.Errorf("password is required unless --oauth is used")
+	}
 
 	var client *atclient.APIClient
 	var err error
@@ -231,6 +244,81 @@ func runAccountLogin(ctx context.Context, cmd *cli.Command) error {
 		RefreshToken: passAuth.Session.RefreshToken,
 	}
 	return persistAuthSession(&sess)
+}
+
+func runAccountOAuthLogin(ctx context.Context, cmd *cli.Command) error {
+	if cmd.String("pds-host") != "" {
+		return fmt.Errorf("--pds-host is not supported with --oauth; OAuth discovers the account's PDS from the identifier")
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("starting local OAuth callback server: %w", err)
+	}
+	defer listener.Close()
+
+	callbackURL := fmt.Sprintf("http://%s/oauth/callback", listener.Addr().String())
+	store := newGoatOAuthStore()
+	oauthApp := oauthClientApp(callbackURL, store)
+
+	done := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		sessData, err := oauthApp.ProcessCallback(r.Context(), r.URL.Query())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("OAuth login failed: %v", err), http.StatusBadRequest)
+			done <- err
+			return
+		}
+		fmt.Fprintf(w, "goat OAuth login complete for %s. You can close this tab.\n", sessData.AccountDID)
+		done <- nil
+	})
+
+	server := &http.Server{Handler: mux}
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			done <- err
+		}
+	}()
+	defer server.Shutdown(context.Background())
+
+	redirectURL, err := oauthApp.StartAuthFlow(ctx, cmd.String("username"))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Opening browser for OAuth login: %s\n", redirectURL)
+	if err := openBrowser(redirectURL); err != nil {
+		fmt.Printf("Unable to open browser automatically: %v\nOpen this URL manually: %s\n", err, redirectURL)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		fmt.Println("OAuth login saved")
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func openBrowser(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
 }
 
 func runAccountLogout(ctx context.Context, cmd *cli.Command) error {

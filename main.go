@@ -26,14 +26,6 @@ func main() {
 	}
 }
 
-func stderrIsTerminal() bool {
-	fi, err := os.Stderr.Stat()
-	if err != nil {
-		return false
-	}
-	return (fi.Mode() & os.ModeCharDevice) != 0
-}
-
 func run(args []string) error {
 
 	cmdVersion := versioninfo.Short()

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
 	"github.com/bluesky-social/indigo/atproto/atclient"
+	"github.com/bluesky-social/indigo/atproto/auth/oauth"
 	"github.com/bluesky-social/indigo/atproto/syntax"
 
 	"github.com/adrg/xdg"
@@ -19,11 +21,110 @@ import (
 var ErrNoAuthSession = errors.New("no auth session found")
 
 type AuthSession struct {
-	DID          syntax.DID `json:"did"`
-	Password     string     `json:"password"`
-	AccessToken  string     `json:"access_token"`
-	RefreshToken string     `json:"session_token"`
-	PDS          string     `json:"pds"`
+	AuthMethod       string                   `json:"auth_method,omitempty"`
+	DID              syntax.DID               `json:"did"`
+	Password         string                   `json:"password,omitempty"`
+	AccessToken      string                   `json:"access_token,omitempty"`
+	RefreshToken     string                   `json:"session_token,omitempty"`
+	PDS              string                   `json:"pds,omitempty"`
+	OAuthClientID    string                   `json:"oauth_client_id,omitempty"`
+	OAuthCallbackURL string                   `json:"oauth_callback_url,omitempty"`
+	OAuth            *oauth.ClientSessionData `json:"oauth,omitempty"`
+}
+
+const authMethodOAuth = "oauth"
+
+type goatOAuthStore struct {
+	lk          sync.Mutex
+	requests    map[string]oauth.AuthRequestData
+	clientID    string
+	callbackURL string
+}
+
+func newGoatOAuthStore() *goatOAuthStore {
+	return &goatOAuthStore{requests: make(map[string]oauth.AuthRequestData)}
+}
+
+func (s *goatOAuthStore) GetSession(ctx context.Context, did syntax.DID, sessionID string) (*oauth.ClientSessionData, error) {
+	sess, err := loadAuthSessionFile()
+	if err != nil {
+		return nil, err
+	}
+	if sess.AuthMethod != authMethodOAuth || sess.OAuth == nil {
+		return nil, ErrNoAuthSession
+	}
+	if sess.OAuth.AccountDID != did || sess.OAuth.SessionID != sessionID {
+		return nil, fmt.Errorf("OAuth session not found: %s/%s", did, sessionID)
+	}
+	data := *sess.OAuth
+	return &data, nil
+}
+
+func (s *goatOAuthStore) SaveSession(ctx context.Context, data oauth.ClientSessionData) error {
+	sess := AuthSession{
+		AuthMethod:       authMethodOAuth,
+		DID:              data.AccountDID,
+		PDS:              data.HostURL,
+		OAuthClientID:    s.clientID,
+		OAuthCallbackURL: s.callbackURL,
+		OAuth:            &data,
+	}
+	return persistAuthSession(&sess)
+}
+
+func (s *goatOAuthStore) DeleteSession(ctx context.Context, did syntax.DID, sessionID string) error {
+	return wipeAuthSession()
+}
+
+func (s *goatOAuthStore) GetAuthRequestInfo(ctx context.Context, state string) (*oauth.AuthRequestData, error) {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+	info, ok := s.requests[state]
+	if !ok {
+		return nil, fmt.Errorf("OAuth request info not found: %s", state)
+	}
+	return &info, nil
+}
+
+func (s *goatOAuthStore) SaveAuthRequestInfo(ctx context.Context, info oauth.AuthRequestData) error {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+	if _, ok := s.requests[info.State]; ok {
+		return fmt.Errorf("OAuth request info already saved: %s", info.State)
+	}
+	s.requests[info.State] = info
+	return nil
+}
+
+func (s *goatOAuthStore) DeleteAuthRequestInfo(ctx context.Context, state string) error {
+	s.lk.Lock()
+	defer s.lk.Unlock()
+	delete(s.requests, state)
+	return nil
+}
+
+func oauthClientApp(callbackURL string, store oauth.ClientAuthStore) *oauth.ClientApp {
+	config := oauth.NewLocalhostConfig(callbackURL, []string{"atproto", "transition:generic"})
+	config.UserAgent = userAgentString()
+	if s, ok := store.(*goatOAuthStore); ok {
+		s.clientID = config.ClientID
+		s.callbackURL = config.CallbackURL
+	}
+	return oauth.NewClientApp(&config, store)
+}
+
+func oauthClientAppForSession(sess *AuthSession, store *goatOAuthStore) *oauth.ClientApp {
+	callbackURL := sess.OAuthCallbackURL
+	if callbackURL == "" {
+		callbackURL = "http://127.0.0.1/oauth/callback"
+	}
+	app := oauthClientApp(callbackURL, store)
+	if sess.OAuthClientID != "" {
+		app.Config.ClientID = sess.OAuthClientID
+		store.clientID = sess.OAuthClientID
+	}
+	store.callbackURL = callbackURL
+	return app
 }
 
 func persistAuthSession(sess *AuthSession) error {
@@ -106,6 +207,23 @@ func loadAuthClient(ctx context.Context, cmd *cli.Command) (*atclient.APIClient,
 	sess, err := loadAuthSessionFile()
 	if err != nil {
 		return nil, err
+	}
+	if sess.AuthMethod == authMethodOAuth || sess.OAuth != nil {
+		if sess.OAuth == nil {
+			return nil, fmt.Errorf("OAuth session data missing")
+		}
+		store := newGoatOAuthStore()
+		app := oauthClientAppForSession(sess, store)
+		oauthSess, err := app.ResumeSession(ctx, sess.OAuth.AccountDID, sess.OAuth.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		client := oauthSess.APIClient()
+		_, err = comatproto.ServerGetSession(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
 	}
 
 	// first try to resume session
